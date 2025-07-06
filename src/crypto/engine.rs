@@ -1,23 +1,30 @@
 //! Core cryptographic engine implementation
 
 use std::sync::Arc;
-use crate::error::PDFCryptoError;
+use std::collections::HashMap;
+use md5::{Md5, Digest};
+use rand::{thread_rng, RngCore};
+use log::{debug, warn};
+
+use crate::error::{PDFCryptoError, PDFCryptoResult};
 use crate::EncryptionAlgorithm;
 use crate::handlers::SecurityHandler;
 use crate::pdf::PDFParser;
 use super::{rc4, aes, CryptoProvider};
 
 /// Core engine for PDF encryption/decryption operations
+#[derive(Debug)]
 pub struct PDFCryptoEngine {
     providers: Arc<ProvidersMap>,
 }
 
-type ProvidersMap = std::collections::HashMap<EncryptionAlgorithm, Box<dyn CryptoProvider>>;
+type ProvidersMap = HashMap<EncryptionAlgorithm, Box<dyn CryptoProvider>>;
 
 impl PDFCryptoEngine {
     /// Create new cryptographic engine instance
     pub fn new() -> Self {
-        let mut providers = std::collections::HashMap::new();
+        debug!("Initializing PDF cryptographic engine");
+        let mut providers = HashMap::new();
         
         providers.insert(EncryptionAlgorithm::RC4_40, 
             Box::new(rc4::RC4Provider::new(5)) as Box<dyn CryptoProvider>);
@@ -39,12 +46,14 @@ impl PDFCryptoEngine {
         parser: &mut PDFParser,
         file_key: &[u8],
         handler: &SecurityHandler,
-    ) -> Result<(), PDFCryptoError> {
+    ) -> PDFCryptoResult<()> {
+        debug!("Starting PDF object decryption");
         let algorithm = handler.get_algorithm();
         let provider = self.get_provider(algorithm)?;
 
         // Process each encrypted object
         for obj in parser.get_encrypted_objects()? {
+            debug!("Decrypting object {}", obj.number);
             let mut data = obj.data.clone();
             let object_key = self.generate_object_key(
                 file_key,
@@ -57,6 +66,7 @@ impl PDFCryptoEngine {
             parser.update_object_data(obj.number, data)?;
         }
 
+        debug!("PDF object decryption completed");
         Ok(())
     }
 
@@ -66,12 +76,14 @@ impl PDFCryptoEngine {
         parser: &mut PDFParser,
         file_key: &[u8],
         handler: &SecurityHandler,
-    ) -> Result<(), PDFCryptoError> {
+    ) -> PDFCryptoResult<()> {
+        debug!("Starting PDF object encryption");
         let algorithm = handler.get_algorithm();
         let provider = self.get_provider(algorithm)?;
 
         // Process each object that needs encryption
         for obj in parser.get_encryptable_objects()? {
+            debug!("Encrypting object {}", obj.number);
             let mut data = obj.data.clone();
             let object_key = self.generate_object_key(
                 file_key,
@@ -84,6 +96,7 @@ impl PDFCryptoEngine {
             parser.update_object_data(obj.number, data)?;
         }
 
+        debug!("PDF object encryption completed");
         Ok(())
     }
 
@@ -94,16 +107,16 @@ impl PDFCryptoEngine {
         obj_num: u32,
         gen_num: u16,
         algorithm: EncryptionAlgorithm,
-    ) -> Result<Vec<u8>, PDFCryptoError> {
-        use md5::{Md5, Digest};
-        
+    ) -> PDFCryptoResult<Vec<u8>> {
         let mut hasher = Md5::new();
         
         // Input file encryption key
         hasher.update(file_key);
         
-        // Add object number and generation (low order 3 bytes of object number)
+        // Add object number (low order 3 bytes)
         hasher.update(&obj_num.to_le_bytes()[0..3]);
+        
+        // Add generation number
         hasher.update(&gen_num.to_le_bytes());
         
         // Add AES salt if needed
@@ -120,10 +133,15 @@ impl PDFCryptoEngine {
             EncryptionAlgorithm::AES_256 => 32,
         };
         
+        if hash.len() < key_len {
+            return Err(PDFCryptoError::InvalidKeyLength(hash.len()));
+        }
+        
         Ok(hash[..key_len].to_vec())
     }
 
-    fn get_provider(&self, algorithm: EncryptionAlgorithm) -> Result<&dyn CryptoProvider, PDFCryptoError> {
+    /// Get crypto provider for algorithm
+    fn get_provider(&self, algorithm: EncryptionAlgorithm) -> PDFCryptoResult<&dyn CryptoProvider> {
         self.providers
             .get(&algorithm)
             .ok_or_else(|| PDFCryptoError::UnsupportedAlgorithm(algorithm))
@@ -131,9 +149,17 @@ impl PDFCryptoEngine {
     }
 }
 
+impl Default for PDFCryptoEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_log::test;
+    use crate::PDFPermissions;
     use crate::handlers::StandardSecurityHandler;
 
     #[test]
@@ -158,38 +184,83 @@ mod tests {
             EncryptionAlgorithm::AES_256,
         ).unwrap();
         assert_eq!(aes_256_key.len(), 32);
+        
+        // Verify keys are different
+        assert_ne!(rc4_40_key, aes_256_key[..5]);
     }
 
     #[test]
-    fn test_encryption_decryption() -> Result<(), PDFCryptoError> {
+    fn test_provider_selection() {
         let engine = PDFCryptoEngine::new();
-        let test_data = b"Hello, PDF encryption!";
+        
+        assert!(engine.get_provider(EncryptionAlgorithm::RC4_40).is_ok());
+        assert!(engine.get_provider(EncryptionAlgorithm::AES_256).is_ok());
+    }
+
+    #[test]
+    fn test_encryption_decryption() -> PDFCryptoResult<()> {
+        let engine = PDFCryptoEngine::new();
         let file_key = b"test_key_123456789";
         
-        // Create a mock parser with test data
-        let mut parser = PDFParser::new(test_data)?;
+        // Create test data
+        let original_data = b"Test data for encryption".to_vec();
+        let mut test_data = original_data.clone();
         
-        // Create a security handler
+        // Get AES provider
+        let provider = engine.get_provider(EncryptionAlgorithm::AES_256)?;
+        
+        // Generate object key
+        let object_key = engine.generate_object_key(
+            file_key,
+            1,
+            0,
+            EncryptionAlgorithm::AES_256,
+        )?;
+        
+        // Encrypt data
+        provider.process_data(&mut test_data, &object_key)?;
+        assert_ne!(test_data, original_data);
+        
+        // Decrypt data
+        provider.process_data(&mut test_data, &object_key)?;
+        assert_eq!(test_data, original_data);
+        
+        Ok(())
+    }
+
+    #[test]
+    fn test_full_pdf_encryption() -> PDFCryptoResult<()> {
+        let engine = PDFCryptoEngine::new();
+        
+        // Create test PDF data
+        let mut parser = PDFParser::new(include_bytes!("../../../tests/files/sample.pdf"))?;
+        
+        // Create security handler
         let handler = StandardSecurityHandler::new(
             EncryptionAlgorithm::AES_256,
-            0xffffffff,
+            PDFPermissions::all().bits(),
             b"user",
             b"owner",
         )?;
         
-        // Test encryption
-        engine.encrypt_pdf_objects(&mut parser, file_key, &SecurityHandler::Standard(handler.clone()))?;
+        // Generate file key
+        let file_key = handler.generate_file_key()?;
+        
+        // Encrypt PDF objects
+        engine.encrypt_pdf_objects(&mut parser, &file_key, &SecurityHandler::Standard(handler.clone()))?;
         
         // Get encrypted data
-        let encrypted = parser.get_object_data(1)?;
-        assert_ne!(encrypted, test_data);
+        let encrypted = parser.rebuild_pdf();
         
-        // Test decryption
-        engine.decrypt_pdf_objects(&mut parser, file_key, &SecurityHandler::Standard(handler))?;
+        // Create new parser for decryption
+        let mut parser = PDFParser::new(&encrypted)?;
         
-        // Verify decrypted data matches original
-        let decrypted = parser.get_object_data(1)?;
-        assert_eq!(decrypted, test_data);
+        // Decrypt PDF objects
+        engine.decrypt_pdf_objects(&mut parser, &file_key, &SecurityHandler::Standard(handler))?;
+        
+        // Verify decrypted data
+        let decrypted = parser.rebuild_pdf();
+        assert_eq!(decrypted, include_bytes!("../../../tests/files/sample.pdf"));
         
         Ok(())
     }
